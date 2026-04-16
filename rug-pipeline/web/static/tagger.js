@@ -23,27 +23,29 @@
   // ── Design list ──────────────────────────────────────────────
 
   async function loadDesigns() {
-    const resp = await fetch("/api/designs?needs_review=true");
+    const resp = await fetch("/api/designs");
     const designs = await resp.json();
 
     const listEl = document.getElementById("design-list");
     const countEl = document.getElementById("review-count");
+    var reviewCount = designs.filter(function (d) { return d.zone_map.needs_review; }).length;
     countEl.textContent = designs.length;
 
     listEl.innerHTML = "";
     if (designs.length === 0) {
-      listEl.innerHTML = '<div style="padding:16px;color:#aaa;">No designs need review</div>';
+      listEl.innerHTML = '<div style="padding:16px;color:#aaa;">No designs found</div>';
       return;
     }
 
     designs.forEach(function (d) {
+      var needsReview = d.zone_map.needs_review;
       const item = document.createElement("div");
       item.className = "design-item";
       item.dataset.id = d.design_id;
       item.innerHTML =
         '<div class="id">Design ' + d.design_id + "</div>" +
         '<div class="meta">Confidence: ' + (d.zone_map.confidence * 100).toFixed(0) + "%</div>" +
-        '<div class="review-tag">Needs Review</div>';
+        (needsReview ? '<div class="review-tag">Needs Review</div>' : '<div class="meta" style="color:#27ae60;">OK</div>');
       item.addEventListener("click", function () {
         document.querySelectorAll(".design-item").forEach(function (el) { el.classList.remove("active"); });
         item.classList.add("active");
@@ -89,6 +91,7 @@
         '<label>Right <input type="number" id="input-right" min="0"></label>' +
         '<button class="btn-save" id="btn-save">Save</button>' +
         '<button class="btn-reset" id="btn-reset">Reset</button>' +
+        '<button class="btn-delete" id="btn-delete">Delete</button>' +
         '<span class="status" id="status">Saved!</span>' +
       "</div>";
 
@@ -133,6 +136,9 @@
     document.getElementById("btn-save").addEventListener("click", saveZones);
     document.getElementById("btn-reset").addEventListener("click", function () {
       openDesign(designId);
+    });
+    document.getElementById("btn-delete").addEventListener("click", function () {
+      deleteDesign(designId);
     });
   }
 
@@ -257,6 +263,23 @@
       setTimeout(function () { statusEl.classList.remove("show"); }, 2000);
 
       // Refresh the list (design may no longer need review)
+      loadDesigns();
+    }
+  }
+
+  // ── Delete ───────────────────────────────────────────────────
+
+  async function deleteDesign(designId) {
+    if (!confirm("Delete design " + designId + "? This cannot be undone.")) return;
+
+    var resp = await fetch("/api/designs/" + designId, {
+      method: "DELETE",
+    });
+
+    if (resp.ok) {
+      currentDesign = null;
+      document.getElementById("editor").innerHTML =
+        '<div class="editor-empty">Design deleted. Select another design.</div>';
       loadDesigns();
     }
   }
