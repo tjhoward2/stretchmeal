@@ -51,6 +51,7 @@ class PipelineConfig:
     realesrgan_binary: str = "realesrgan-ncnn-vulkan"
     realesrgan_scale: int = 4  # 4x upscale factor
     realesrgan_model: str = "realesrgan-x4plus"
+    realesrgan_models_dir: str | None = None  # auto-detects from binary location
 
     def ensure_dirs(self) -> None:
         """Create all required directories if they don't exist."""
