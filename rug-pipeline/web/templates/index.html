@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rug Zone Tagger</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; color: #333; }
+        header { background: #2c3e50; color: white; padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; }
+        header h1 { font-size: 1.3rem; font-weight: 600; }
+        .badge { background: #e74c3c; color: white; border-radius: 12px; padding: 2px 10px; font-size: 0.85rem; margin-left: 8px; }
+
+        .container { display: flex; height: calc(100vh - 56px); }
+
+        /* Sidebar */
+        .sidebar { width: 280px; background: white; border-right: 1px solid #ddd; overflow-y: auto; flex-shrink: 0; }
+        .sidebar h2 { font-size: 0.9rem; color: #888; text-transform: uppercase; letter-spacing: 0.05em; padding: 16px 16px 8px; }
+        .design-item { padding: 12px 16px; cursor: pointer; border-bottom: 1px solid #eee; transition: background 0.15s; }
+        .design-item:hover { background: #f0f4f8; }
+        .design-item.active { background: #e8f0fe; border-left: 3px solid #3498db; }
+        .design-item .id { font-weight: 600; font-size: 0.95rem; }
+        .design-item .meta { font-size: 0.8rem; color: #888; margin-top: 2px; }
+        .design-item .review-tag { color: #e74c3c; font-weight: 600; font-size: 0.8rem; }
+
+        /* Editor */
+        .editor { flex: 1; display: flex; flex-direction: column; align-items: center; padding: 24px; overflow: auto; }
+        .editor-empty { color: #aaa; font-size: 1.1rem; margin-top: 40vh; }
+
+        .image-container { position: relative; display: inline-block; border: 1px solid #ccc; background: #ddd; }
+        .image-container img { display: block; max-width: 80vw; max-height: 65vh; }
+
+        /* Guide lines */
+        .guide { position: absolute; background: rgba(231, 76, 60, 0.7); z-index: 10; }
+        .guide.horizontal { height: 2px; left: 0; right: 0; cursor: ns-resize; }
+        .guide.horizontal::after { content: ''; position: absolute; left: 0; right: 0; top: -4px; bottom: -4px; }
+        .guide.vertical { width: 2px; top: 0; bottom: 0; cursor: ew-resize; }
+        .guide.vertical::after { content: ''; position: absolute; top: 0; bottom: 0; left: -4px; right: -4px; }
+        .guide-label { position: absolute; background: rgba(231, 76, 60, 0.85); color: white; font-size: 11px; padding: 1px 6px; border-radius: 3px; pointer-events: none; white-space: nowrap; }
+
+        /* Controls */
+        .controls { margin-top: 16px; display: flex; gap: 12px; align-items: center; }
+        .controls input { width: 80px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; text-align: center; }
+        .controls label { font-size: 0.85rem; color: #555; }
+        .controls button { padding: 8px 20px; border: none; border-radius: 4px; cursor: pointer; font-size: 0.9rem; font-weight: 600; }
+        .btn-save { background: #27ae60; color: white; }
+        .btn-save:hover { background: #219a52; }
+        .btn-reset { background: #95a5a6; color: white; }
+        .btn-reset:hover { background: #7f8c8d; }
+        .status { font-size: 0.85rem; color: #27ae60; margin-left: 12px; opacity: 0; transition: opacity 0.3s; }
+        .status.show { opacity: 1; }
+    </style>
+</head>
+<body>
+    <header>
+        <div style="display:flex;align-items:center;">
+            <h1>Rug Zone Tagger</h1>
+            <span class="badge" id="review-count">0</span>
+        </div>
+    </header>
+    <div class="container">
+        <div class="sidebar">
+            <h2>Designs Needing Review</h2>
+            <div id="design-list"></div>
+        </div>
+        <div class="editor" id="editor">
+            <div class="editor-empty">Select a design to begin zone tagging</div>
+        </div>
+    </div>
+    <script src="/static/tagger.js"></script>
+</body>
+</html>
