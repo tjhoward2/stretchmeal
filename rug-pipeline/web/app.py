@@ -115,6 +115,26 @@ def update_zones(design_id: str):
     return jsonify(zone_map)
 
 
+@app.route("/api/designs/<design_id>", methods=["DELETE"])
+def delete_design(design_id: str):
+    """Delete a design and all its files from storage."""
+    keys = storage.list_keys(f"{design_id}/", masters_bucket)
+    if not keys:
+        return jsonify({"error": "Design not found"}), 404
+
+    for key in keys:
+        storage.delete(key, masters_bucket)
+
+    # Also clean up local cache if it exists
+    cache_dir = config.cache_dir / design_id
+    if cache_dir.exists():
+        import shutil
+        shutil.rmtree(str(cache_dir))
+
+    logger.info("Deleted design %s (%d files)", design_id, len(keys))
+    return jsonify({"deleted": design_id, "files_removed": len(keys)})
+
+
 def create_app(data_dir: str | None = None, storage_backend: str | None = None) -> Flask:
     """Factory function for creating the Flask app with custom config."""
     global config, storage, masters_bucket

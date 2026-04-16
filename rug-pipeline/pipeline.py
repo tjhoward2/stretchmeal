@@ -26,6 +26,7 @@ from detection.border_detect import detect_borders
 from ingest.flatten import flatten_psd
 from ingest.validate import validate_flatten
 from scaling.cache import check_cache, cleanup_cache, write_cache
+from scaling.layered_psd import scale_layered_psd
 from scaling.nine_slice import nine_slice_scale
 from scaling.resize import lanczos_resize, make_esrgan_resize, needs_upscale
 from storage.backend import StorageBackend, create_backend
@@ -201,6 +202,10 @@ def cmd_scale(args: argparse.Namespace, config: PipelineConfig) -> None:
             seam_threshold=config.seam_threshold,
         )
 
+        # Force pixels into RAM before temp dir is cleaned up
+        # (pyvips uses lazy I/O — the image still references the temp file)
+        result = result.copy_memory()
+
     # Save to local cache (outside temp dir — result is in memory)
     output_path = write_cache(
         result, config.cache_dir, design_id,
@@ -329,6 +334,61 @@ def cmd_validate(args: argparse.Namespace, config: PipelineConfig) -> None:
     print(f"  Threshold: {result['threshold']}")
 
 
+def cmd_scale_psd(args: argparse.Namespace, config: PipelineConfig) -> None:
+    """Scale a layered PSD to a new rug size, preserving layers."""
+    width_ft = args.width
+    height_ft = args.height
+    dpi = args.dpi
+    target_w = int(width_ft * 12 * dpi)
+    target_h = int(height_ft * 12 * dpi)
+
+    storage, masters_bucket, archive_bucket = _get_storage(config)
+
+    # Get the PSD file — either from --psd flag or archive
+    if args.psd:
+        psd_path = Path(args.psd)
+        if not psd_path.exists():
+            logger.error("PSD file not found: %s", psd_path)
+            sys.exit(1)
+    else:
+        if not args.design_id:
+            logger.error("Must provide either --psd or --design-id")
+            sys.exit(1)
+        # Download from archive
+        archive_keys = storage.list_keys(f"{args.design_id}/", archive_bucket)
+        originals = [k for k in archive_keys if "/original." in k]
+        if not originals:
+            logger.error("Original PSD not found in archive for design %s", args.design_id)
+            sys.exit(1)
+        psd_path = Path(tempfile.mkdtemp(prefix="rug_psd_")) / Path(originals[0]).name
+        storage.get(originals[0], archive_bucket, psd_path)
+
+    # Get zone map — either from --zone-map flag or storage
+    if args.zone_map:
+        zone_map = json.loads(Path(args.zone_map).read_text())
+    elif args.design_id:
+        zone_map = storage.read_json(f"{args.design_id}/zone_map.json", masters_bucket)
+    else:
+        logger.error("Must provide either --zone-map or --design-id")
+        sys.exit(1)
+
+    # Output path
+    design_label = args.design_id or psd_path.stem
+    output_dir = config.cache_dir / design_label
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{width_ft}x{height_ft}_{dpi}dpi_layered.psd"
+
+    logger.info(
+        "Scaling layered PSD to %sx%s ft (%dx%d px at %d DPI)",
+        width_ft, height_ft, target_w, target_h, dpi,
+    )
+
+    scale_layered_psd(psd_path, output_path, zone_map, target_w, target_h)
+
+    logger.info("Output saved: %s", output_path)
+    print(str(output_path))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Rug design pipeline — ingest, scale, and manage rug designs.",
@@ -379,6 +439,15 @@ def main() -> None:
     p_validate = subparsers.add_parser("validate", help="Validate a design's master")
     p_validate.add_argument("--design-id", required=True)
 
+    # scale-psd
+    p_scale_psd = subparsers.add_parser("scale-psd", help="Scale a layered PSD preserving layers")
+    p_scale_psd.add_argument("--design-id", help="Design ID (fetches PSD from archive)")
+    p_scale_psd.add_argument("--psd", help="Path to PSD file (alternative to --design-id)")
+    p_scale_psd.add_argument("--zone-map", help="Path to zone map JSON (alternative to --design-id)")
+    p_scale_psd.add_argument("--width", type=float, required=True, help="Width in feet")
+    p_scale_psd.add_argument("--height", type=float, required=True, help="Height in feet")
+    p_scale_psd.add_argument("--dpi", type=int, default=150)
+
     args = parser.parse_args()
 
     # Configure logging
@@ -396,6 +465,7 @@ def main() -> None:
     commands = {
         "ingest": cmd_ingest,
         "scale": cmd_scale,
+        "scale-psd": cmd_scale_psd,
         "set-zones": cmd_set_zones,
         "cleanup-cache": cmd_cleanup_cache,
         "list": cmd_list,
