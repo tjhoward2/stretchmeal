@@ -28,6 +28,7 @@ def make_esrgan_resize(
     binary: str = "realesrgan-ncnn-vulkan",
     scale: int = 4,
     model: str = "realesrgan-x4plus",
+    models_dir: str | None = None,
 ) -> callable:
     """Create a resize function that uses Real-ESRGAN for upscaling.
 
@@ -39,17 +40,27 @@ def make_esrgan_resize(
         binary: Name or path of the realesrgan-ncnn-vulkan binary.
         scale: Upscale factor (default 4x).
         model: Model name for Real-ESRGAN.
+        models_dir: Directory containing model files. If None, auto-detects
+                    from the binary's parent directory.
 
     Returns:
         A resize function (image, target_w, target_h) -> image.
     """
-    if not shutil.which(binary):
+    binary_path = shutil.which(binary)
+    if not binary_path:
         logger.warning(
             "Real-ESRGAN binary '%s' not found on PATH. "
             "AI upscaling unavailable — will fall back to Lanczos.",
             binary,
         )
         return lanczos_resize
+
+    # Auto-detect models directory from binary location
+    if models_dir is None:
+        auto_models = Path(binary_path).parent / "models"
+        if auto_models.is_dir():
+            models_dir = str(auto_models)
+            logger.info("Auto-detected Real-ESRGAN models dir: %s", models_dir)
 
     def esrgan_resize(image: pyvips.Image, target_w: int, target_h: int) -> pyvips.Image:
         """Upscale with Real-ESRGAN, then Lanczos-resize to exact target."""
@@ -72,14 +83,20 @@ def make_esrgan_resize(
                 "-s", str(scale),
                 "-n", model,
             ]
+            if models_dir:
+                cmd.extend(["-m", models_dir])
 
-            logger.info("Running Real-ESRGAN: %s", " ".join(cmd))
+            logger.info(
+                "Running Real-ESRGAN on %dx%d image (target %dx%d): %s",
+                image.width, image.height, target_w, target_h, " ".join(cmd),
+            )
             try:
                 result = subprocess.run(
                     cmd, capture_output=True, text=True, timeout=600,
                 )
                 if result.returncode != 0:
-                    logger.error("Real-ESRGAN failed: %s", result.stderr)
+                    logger.error("Real-ESRGAN failed (exit %d): %s",
+                                 result.returncode, result.stderr)
                     logger.warning("Falling back to Lanczos upscale")
                     return lanczos_resize(image, target_w, target_h)
             except (subprocess.TimeoutExpired, FileNotFoundError) as e:
@@ -87,11 +104,23 @@ def make_esrgan_resize(
                 logger.warning("Falling back to Lanczos upscale")
                 return lanczos_resize(image, target_w, target_h)
 
-            # Load the upscaled result
-            upscaled = pyvips.Image.new_from_file(str(output_path))
+            # Verify output was actually created
+            if not output_path.exists():
+                logger.error(
+                    "Real-ESRGAN produced no output file. "
+                    "stderr: %s", result.stderr.strip() if result.stderr else "(empty)",
+                )
+                logger.warning("Falling back to Lanczos upscale")
+                return lanczos_resize(image, target_w, target_h)
 
-            # Final Lanczos resize to exact target dimensions
-            return lanczos_resize(upscaled, target_w, target_h)
+            # Load the upscaled result into memory before temp dir is cleaned.
+            # pyvips uses lazy I/O, so we must force a full read here.
+            upscaled = pyvips.Image.new_from_file(
+                str(output_path), access="sequential"
+            ).copy_memory()
+
+        # Final Lanczos resize to exact target dimensions (outside with block)
+        return lanczos_resize(upscaled, target_w, target_h)
 
     return esrgan_resize
 

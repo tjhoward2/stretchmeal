@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rug-pipeline"
+version = "0.1.0"
+description = "Rug design pipeline — ingest, border detection, 9-slice scaling, and zone tagging"
+requires-python = ">=3.10"
+dependencies = [
+    "pyvips>=2.2.1",
+    "opencv-python-headless>=4.8.0",
+    "scikit-image>=0.21.0",
+    "flask>=3.0.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[project.scripts]
+rug-pipeline = "pipeline:main"
+
+[tool.setuptools.packages.find]
+include = ["ingest*", "detection*", "scaling*", "web*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+log_cli = true
+log_cli_level = "WARNING"

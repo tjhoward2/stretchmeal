@@ -157,6 +157,7 @@ def cmd_scale(args: argparse.Namespace, config: PipelineConfig) -> None:
         logger.info("Upscale needed — attempting Real-ESRGAN")
         resize_fn = make_esrgan_resize(
             config.realesrgan_binary, config.realesrgan_scale, config.realesrgan_model,
+            models_dir=config.realesrgan_models_dir,
         )
     else:
         resize_fn = lanczos_resize
