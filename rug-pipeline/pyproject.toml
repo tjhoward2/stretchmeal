@@ -13,11 +13,13 @@ dependencies = [
     "scikit-image>=0.21.0",
     "flask>=3.0.0",
     "numpy>=1.24.0",
+    "boto3>=1.28.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
+    "moto[s3]>=5.0",
 ]
 
 [project.scripts]

@@ -15,6 +15,7 @@ import json
 import logging
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 # Add project root to path so modules are importable
@@ -27,8 +28,27 @@ from ingest.validate import validate_flatten
 from scaling.cache import check_cache, cleanup_cache, write_cache
 from scaling.nine_slice import nine_slice_scale
 from scaling.resize import lanczos_resize, make_esrgan_resize, needs_upscale
+from storage.backend import StorageBackend, create_backend
 
 logger = logging.getLogger("pipeline")
+
+
+def _get_storage(config: PipelineConfig) -> tuple[StorageBackend, str, str]:
+    """Create storage backend and return (backend, masters_bucket, archive_bucket)."""
+    backend = create_backend(
+        config.storage_backend,
+        region=config.s3_region,
+        glacier_transition_days=config.s3_glacier_transition_days,
+    )
+
+    if config.storage_backend == "s3":
+        masters_bucket = config.s3_masters_bucket
+        archive_bucket = config.s3_archive_bucket
+    else:
+        masters_bucket = str(config.masters_dir)
+        archive_bucket = str(config.archive_dir)
+
+    return backend, masters_bucket, archive_bucket
 
 
 def cmd_ingest(args: argparse.Namespace, config: PipelineConfig) -> None:
@@ -41,73 +61,79 @@ def cmd_ingest(args: argparse.Namespace, config: PipelineConfig) -> None:
         sys.exit(1)
 
     config.ensure_dirs()
-    design_dir = config.masters_dir / design_id
-    design_dir.mkdir(parents=True, exist_ok=True)
+    storage, masters_bucket, archive_bucket = _get_storage(config)
 
-    master_tiff = design_dir / "master.tiff"
-    thumbnail = design_dir / "thumbnail.png"
-    zone_map_path = design_dir / "zone_map.json"
+    # Always flatten to local temp first (pyvips needs local files)
+    with tempfile.TemporaryDirectory(prefix="rug_ingest_") as tmpdir:
+        tmpdir = Path(tmpdir)
+        master_tiff = tmpdir / "master.tiff"
+        thumbnail = tmpdir / "thumbnail.png"
 
-    # Step 1: Flatten PSD
-    logger.info("Step 1/4: Flattening PSD...")
-    try:
-        master = flatten_psd(psd_path, master_tiff, thumbnail, config.thumbnail_width_px)
-    except Exception as e:
-        logger.error("Flattening failed: %s. Original PSD left in place.", e)
-        sys.exit(1)
+        # Step 1: Flatten PSD
+        logger.info("Step 1/4: Flattening PSD...")
+        try:
+            master = flatten_psd(psd_path, master_tiff, thumbnail, config.thumbnail_width_px)
+        except Exception as e:
+            logger.error("Flattening failed: %s. Original PSD left in place.", e)
+            sys.exit(1)
 
-    # Step 2: Border detection
-    logger.info("Step 2/4: Detecting borders...")
-    zone_map = detect_borders(
-        master,
-        design_id,
-        detection_width=config.border_detection_width_px,
-        canny_low=config.canny_low,
-        canny_high=config.canny_high,
-        gradient_weight=config.gradient_weight,
-        edge_weight=config.edge_weight,
-        confidence_threshold=config.border_confidence_threshold,
-    )
-
-    if zone_map["confidence"] < config.border_confidence_threshold:
-        logger.warning(
-            "Border detection confidence %.2f is below threshold %.2f. "
-            "Design flagged for manual zone tagging.",
-            zone_map["confidence"],
-            config.border_confidence_threshold,
+        # Step 2: Border detection
+        logger.info("Step 2/4: Detecting borders...")
+        zone_map = detect_borders(
+            master,
+            design_id,
+            detection_width=config.border_detection_width_px,
+            canny_low=config.canny_low,
+            canny_high=config.canny_high,
+            gradient_weight=config.gradient_weight,
+            edge_weight=config.edge_weight,
+            confidence_threshold=config.border_confidence_threshold,
         )
 
-    zone_map_path.write_text(json.dumps(zone_map, indent=2))
-    logger.info("Zone map saved: %s", zone_map_path)
+        if zone_map["confidence"] < config.border_confidence_threshold:
+            logger.warning(
+                "Border detection confidence %.2f is below threshold %.2f. "
+                "Design flagged for manual zone tagging.",
+                zone_map["confidence"],
+                config.border_confidence_threshold,
+            )
 
-    # Step 3: Validation
-    logger.info("Step 3/4: Validating flattened output...")
-    validation = validate_flatten(
-        psd_path, master_tiff,
-        ssim_threshold=config.validation_ssim_threshold,
-    )
-
-    if not validation["passed"]:
-        logger.warning(
-            "Validation SSIM %.4f below threshold %.2f. Flagging for review.",
-            validation["ssim_score"],
-            config.validation_ssim_threshold,
+        # Step 3: Validation
+        logger.info("Step 3/4: Validating flattened output...")
+        validation = validate_flatten(
+            psd_path, master_tiff,
+            ssim_threshold=config.validation_ssim_threshold,
         )
-        zone_map["needs_review"] = True
-        zone_map_path.write_text(json.dumps(zone_map, indent=2))
+
+        if not validation["passed"]:
+            logger.warning(
+                "Validation SSIM %.4f below threshold %.2f. Flagging for review.",
+                validation["ssim_score"],
+                config.validation_ssim_threshold,
+            )
+            zone_map["needs_review"] = True
+
+        # Upload outputs to storage backend
+        logger.info("Uploading master, thumbnail, and zone map...")
+        storage.put(master_tiff, f"{design_id}/master.tiff", masters_bucket)
+        storage.put(thumbnail, f"{design_id}/thumbnail.png", masters_bucket)
+        storage.write_json(zone_map, f"{design_id}/zone_map.json", masters_bucket)
+        logger.info("Uploaded to masters storage: %s", masters_bucket)
 
     # Step 4: Archive original PSD
     logger.info("Step 4/4: Archiving original PSD...")
-    archive_dir = config.archive_dir / design_id
-    archive_dir.mkdir(parents=True, exist_ok=True)
-    archive_dest = archive_dir / f"original{psd_path.suffix}"
-    shutil.move(str(psd_path), str(archive_dest))
-    logger.info("Archived PSD to: %s", archive_dest)
+    archive_key = f"{design_id}/original{psd_path.suffix}"
+    storage.put(psd_path, archive_key, archive_bucket)
 
-    logger.info(
-        "Ingest complete for design %s. Master: %s",
-        design_id, master_tiff,
-    )
+    # Configure Glacier lifecycle if using S3
+    if config.storage_backend == "s3":
+        storage.configure_glacier_lifecycle(archive_bucket)
+
+    # Remove original PSD after successful archive
+    psd_path.unlink()
+    logger.info("Archived PSD and removed local copy")
+
+    logger.info("Ingest complete for design %s", design_id)
 
 
 def cmd_scale(args: argparse.Namespace, config: PipelineConfig) -> None:
@@ -118,58 +144,64 @@ def cmd_scale(args: argparse.Namespace, config: PipelineConfig) -> None:
     dpi = args.dpi
 
     config.ensure_dirs()
+    storage, masters_bucket, _ = _get_storage(config)
 
-    # Check cache first
+    # Check local cache first
     cached = check_cache(config.cache_dir, design_id, width_ft, height_ft, dpi, config.cache_max_age_days)
     if cached:
         logger.info("Using cached file: %s", cached)
         print(str(cached))
         return
 
-    # Load master and zone map
-    design_dir = config.masters_dir / design_id
-    master_path = design_dir / "master.tiff"
-    zone_map_path = design_dir / "zone_map.json"
+    # Download master and zone map to local temp (pyvips needs local files)
+    with tempfile.TemporaryDirectory(prefix="rug_scale_") as tmpdir:
+        tmpdir = Path(tmpdir)
+        local_master = tmpdir / "master.tiff"
+        zone_map_key = f"{design_id}/zone_map.json"
+        master_key = f"{design_id}/master.tiff"
 
-    if not master_path.exists():
-        logger.error("Master TIFF not found for design %s", design_id)
-        sys.exit(1)
+        if not storage.exists(master_key, masters_bucket):
+            logger.error("Master TIFF not found for design %s", design_id)
+            sys.exit(1)
 
-    if not zone_map_path.exists():
-        logger.error("Zone map not found for design %s", design_id)
-        sys.exit(1)
+        if not storage.exists(zone_map_key, masters_bucket):
+            logger.error("Zone map not found for design %s", design_id)
+            sys.exit(1)
 
-    master = __import__("pyvips").Image.new_from_file(str(master_path))
-    zone_map = json.loads(zone_map_path.read_text())
+        storage.get(master_key, masters_bucket, local_master)
+        zone_map = storage.read_json(zone_map_key, masters_bucket)
 
-    # Calculate target pixels
-    target_w = int(width_ft * 12 * dpi)
-    target_h = int(height_ft * 12 * dpi)
+        import pyvips
+        master = pyvips.Image.new_from_file(str(local_master))
 
-    logger.info(
-        "Scaling design %s to %sx%s ft (%dx%d px at %d DPI)",
-        design_id, width_ft, height_ft, target_w, target_h, dpi,
-    )
+        # Calculate target pixels
+        target_w = int(width_ft * 12 * dpi)
+        target_h = int(height_ft * 12 * dpi)
 
-    # Choose resize function
-    upscale = needs_upscale(master.width, master.height, target_w, target_h)
-    if upscale:
-        logger.info("Upscale needed — attempting Real-ESRGAN")
-        resize_fn = make_esrgan_resize(
-            config.realesrgan_binary, config.realesrgan_scale, config.realesrgan_model,
-            models_dir=config.realesrgan_models_dir,
+        logger.info(
+            "Scaling design %s to %sx%s ft (%dx%d px at %d DPI)",
+            design_id, width_ft, height_ft, target_w, target_h, dpi,
         )
-    else:
-        resize_fn = lanczos_resize
 
-    # 9-slice scale
-    result = nine_slice_scale(
-        master, zone_map, target_w, target_h,
-        resize_fn=resize_fn,
-        seam_threshold=config.seam_threshold,
-    )
+        # Choose resize function
+        upscale = needs_upscale(master.width, master.height, target_w, target_h)
+        if upscale:
+            logger.info("Upscale needed — attempting Real-ESRGAN")
+            resize_fn = make_esrgan_resize(
+                config.realesrgan_binary, config.realesrgan_scale, config.realesrgan_model,
+                models_dir=config.realesrgan_models_dir,
+            )
+        else:
+            resize_fn = lanczos_resize
 
-    # Save to cache
+        # 9-slice scale
+        result = nine_slice_scale(
+            master, zone_map, target_w, target_h,
+            resize_fn=resize_fn,
+            seam_threshold=config.seam_threshold,
+        )
+
+    # Save to local cache (outside temp dir — result is in memory)
     output_path = write_cache(
         result, config.cache_dir, design_id,
         width_ft, height_ft, dpi,
@@ -183,17 +215,21 @@ def cmd_scale(args: argparse.Namespace, config: PipelineConfig) -> None:
 def cmd_set_zones(args: argparse.Namespace, config: PipelineConfig) -> None:
     """Manually set border zones for a design."""
     design_id = args.design_id
-    design_dir = config.masters_dir / design_id
-    zone_map_path = design_dir / "zone_map.json"
-    master_path = design_dir / "master.tiff"
+    storage, masters_bucket, _ = _get_storage(config)
 
-    if not master_path.exists():
+    master_key = f"{design_id}/master.tiff"
+    if not storage.exists(master_key, masters_bucket):
         logger.error("Master TIFF not found for design %s", design_id)
         sys.exit(1)
 
-    # Read master dimensions
-    import pyvips
-    master = pyvips.Image.new_from_file(str(master_path))
+    # Get master dimensions — download to temp to read with pyvips
+    with tempfile.TemporaryDirectory(prefix="rug_zones_") as tmpdir:
+        local_master = Path(tmpdir) / "master.tiff"
+        storage.get(master_key, masters_bucket, local_master)
+
+        import pyvips
+        master = pyvips.Image.new_from_file(str(local_master))
+        master_w, master_h = master.width, master.height
 
     zone_map = {
         "design_id": design_id,
@@ -201,14 +237,14 @@ def cmd_set_zones(args: argparse.Namespace, config: PipelineConfig) -> None:
         "border_bottom_px": args.bottom,
         "border_left_px": args.left,
         "border_right_px": args.right,
-        "master_width_px": master.width,
-        "master_height_px": master.height,
+        "master_width_px": master_w,
+        "master_height_px": master_h,
         "detection_method": "manual",
         "confidence": 1.0,
         "needs_review": False,
     }
 
-    zone_map_path.write_text(json.dumps(zone_map, indent=2))
+    storage.write_json(zone_map, f"{design_id}/zone_map.json", masters_bucket)
     logger.info("Zone map updated for design %s: %s", design_id, zone_map)
 
 
@@ -223,22 +259,20 @@ def cmd_cleanup_cache(args: argparse.Namespace, config: PipelineConfig) -> None:
 
 def cmd_list(args: argparse.Namespace, config: PipelineConfig) -> None:
     """List all designs and their status."""
-    masters_dir = config.masters_dir
+    storage, masters_bucket, _ = _get_storage(config)
 
-    if not masters_dir.exists():
+    # List design IDs by finding zone_map.json files
+    all_keys = storage.list_keys("", masters_bucket)
+    design_ids = sorted({k.split("/")[0] for k in all_keys if "/" in k})
+
+    if not design_ids:
         print("No designs found.")
         return
 
-    designs = sorted(d.name for d in masters_dir.iterdir() if d.is_dir())
-    if not designs:
-        print("No designs found.")
-        return
-
-    for design_id in designs:
-        design_dir = masters_dir / design_id
-        has_master = (design_dir / "master.tiff").exists()
-        has_zones = (design_dir / "zone_map.json").exists()
-        has_thumb = (design_dir / "thumbnail.png").exists()
+    for design_id in design_ids:
+        has_master = storage.exists(f"{design_id}/master.tiff", masters_bucket)
+        has_thumb = storage.exists(f"{design_id}/thumbnail.png", masters_bucket)
+        has_zones = storage.exists(f"{design_id}/zone_map.json", masters_bucket)
 
         status_parts = []
         if has_master:
@@ -248,7 +282,7 @@ def cmd_list(args: argparse.Namespace, config: PipelineConfig) -> None:
 
         needs_review = False
         if has_zones:
-            zone_data = json.loads((design_dir / "zone_map.json").read_text())
+            zone_data = storage.read_json(f"{design_id}/zone_map.json", masters_bucket)
             needs_review = zone_data.get("needs_review", False)
             confidence = zone_data.get("confidence", 0)
             method = zone_data.get("detection_method", "unknown")
@@ -263,23 +297,32 @@ def cmd_list(args: argparse.Namespace, config: PipelineConfig) -> None:
 def cmd_validate(args: argparse.Namespace, config: PipelineConfig) -> None:
     """Validate a design's master against its original."""
     design_id = args.design_id
-    master_path = config.masters_dir / design_id / "master.tiff"
-    archive_path = config.archive_dir / design_id
+    storage, masters_bucket, archive_bucket = _get_storage(config)
 
-    if not master_path.exists():
+    master_key = f"{design_id}/master.tiff"
+    if not storage.exists(master_key, masters_bucket):
         logger.error("Master TIFF not found for design %s", design_id)
         sys.exit(1)
 
     # Find the original in archive
-    originals = list(archive_path.glob("original.*")) if archive_path.exists() else []
+    archive_keys = storage.list_keys(f"{design_id}/", archive_bucket)
+    originals = [k for k in archive_keys if "/original." in k]
     if not originals:
         logger.error("Original file not found in archive for design %s", design_id)
         sys.exit(1)
 
-    result = validate_flatten(
-        originals[0], master_path,
-        ssim_threshold=config.validation_ssim_threshold,
-    )
+    with tempfile.TemporaryDirectory(prefix="rug_validate_") as tmpdir:
+        tmpdir = Path(tmpdir)
+        local_master = tmpdir / "master.tiff"
+        local_original = tmpdir / Path(originals[0]).name
+
+        storage.get(master_key, masters_bucket, local_master)
+        storage.get(originals[0], archive_bucket, local_original)
+
+        result = validate_flatten(
+            local_original, local_master,
+            ssim_threshold=config.validation_ssim_threshold,
+        )
 
     print(f"  SSIM Score: {result['ssim_score']}")
     print(f"  Passed: {result['passed']}")
@@ -293,6 +336,10 @@ def main() -> None:
     parser.add_argument(
         "--data-dir", type=Path, default=Path("./pipeline_data"),
         help="Base directory for pipeline data (default: ./pipeline_data)",
+    )
+    parser.add_argument(
+        "--storage", choices=["local", "s3"], default=None,
+        help="Storage backend (overrides config default)",
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true",
@@ -343,6 +390,8 @@ def main() -> None:
     )
 
     config = PipelineConfig(base_dir=args.data_dir)
+    if args.storage:
+        config.storage_backend = args.storage
 
     commands = {
         "ingest": cmd_ingest,

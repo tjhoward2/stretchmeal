@@ -53,6 +53,13 @@ class PipelineConfig:
     realesrgan_model: str = "realesrgan-x4plus"
     realesrgan_models_dir: str | None = None  # auto-detects from binary location
 
+    # --- Storage backend ---
+    storage_backend: str = "local"  # "local" or "s3"
+    s3_masters_bucket: str = "rug-masters"
+    s3_archive_bucket: str = "rug-archive"
+    s3_region: str = "us-east-1"
+    s3_glacier_transition_days: int = 1  # days before archive → Glacier Deep Archive
+
     def ensure_dirs(self) -> None:
         """Create all required directories if they don't exist."""
         self.masters_dir.mkdir(parents=True, exist_ok=True)
