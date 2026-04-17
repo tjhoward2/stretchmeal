@@ -93,6 +93,20 @@ def scale_layered_psd(
         depth=psd.depth,
     )
 
+    # Check PSD format size limit (~2 GB for layer data, ~30000px max dimension)
+    # PSD format uses 32-bit offsets, so total layer data must be < 4 GB
+    estimated_bytes = target_w * target_h * psd.channels * len(list(psd)) * 2
+    if estimated_bytes > 3_500_000_000:
+        logger.error(
+            "Target size %dx%d with %d layers would exceed PSD format limits (~4 GB). "
+            "Try a lower DPI or fewer layers. PSB (Large Document Format) is not yet supported.",
+            target_w, target_h, len(list(psd)),
+        )
+        raise ValueError(
+            f"Output too large for PSD format ({estimated_bytes / 1e9:.1f} GB estimated). "
+            f"Reduce DPI or target dimensions."
+        )
+
     # Process layers
     rasterized_count = 0
     for layer in psd:
@@ -188,13 +202,17 @@ def _process_layer(layer, parent, ctx: _ScaleContext) -> str | None:
 def _extract_pixels(layer) -> tuple[Image.Image | None, bool]:
     """Extract pixel data from a layer, rasterizing if needed.
 
+    RGBA layers are flattened to RGB by compositing alpha onto white.
+    This prevents transparency artifacts in viewers that don't composite
+    PSD layers properly (e.g., macOS Preview).
+
     Returns (PIL Image, was_rasterized).
     """
     if isinstance(layer, PixelLayer):
         try:
             img = layer.topil()
             if img is not None:
-                return img, False
+                return _flatten_alpha(img), False
         except Exception as e:
             logger.warning("Failed to read pixels from %s: %s", layer.name, e)
 
@@ -206,7 +224,7 @@ def _extract_pixels(layer) -> tuple[Image.Image | None, bool]:
                 "Rasterized layer '%s' (type: %s) — editability lost for this layer",
                 layer.name, type(layer).__name__,
             )
-            return img, True
+            return _flatten_alpha(img), True
     except Exception as e:
         logger.warning("Failed to rasterize %s: %s", layer.name, e)
 
@@ -261,8 +279,8 @@ def _scale_layer_pixels(
     Returns (scaled_image, new_left, new_top).
     """
     if zone == LayerZone.FULL_SPAN:
-        # 9-slice the entire layer to target dimensions
-        scaled = _pil_resize(image, ctx.target_w, ctx.target_h)
+        # Apply 9-slice scaling: borders stay fixed, interior stretches
+        scaled = _pil_nine_slice(image, ctx)
         return scaled, 0, 0
 
     if zone == LayerZone.CORNER:
@@ -284,60 +302,122 @@ def _scale_layer_pixels(
             new_w = max(1, int(image.width * ctx.interior_scale_x))
             scaled = _pil_resize(image, new_w, image.height)
 
-        new_left, new_top = _remap_position(src_left, src_top, scaled.width, scaled.height, ctx)
+        # Use SOURCE dims for position remapping
+        new_left, new_top = _remap_position(src_left, src_top, image.width, image.height, ctx)
         return scaled, new_left, new_top
 
     # INTERIOR: uniform scale + reposition
     new_w = max(1, int(image.width * ctx.interior_scale_x))
     new_h = max(1, int(image.height * ctx.interior_scale_y))
     scaled = _pil_resize(image, new_w, new_h)
-    new_left, new_top = _remap_position(src_left, src_top, scaled.width, scaled.height, ctx)
+    # Use SOURCE dimensions for position remapping (not scaled dims)
+    new_left, new_top = _remap_position(src_left, src_top, image.width, image.height, ctx)
     return scaled, new_left, new_top
 
 
 def _remap_position(
     src_left: int, src_top: int,
-    layer_w: int, layer_h: int,
+    src_layer_w: int, src_layer_h: int,
     ctx: _ScaleContext,
 ) -> tuple[int, int]:
     """Map a layer's position from source coordinates to target coordinates.
+
+    Uses the SOURCE layer dimensions to determine which zone the layer
+    center falls in. This prevents large scaled layers from having their
+    center pushed into the wrong zone.
 
     The mapping preserves:
     - Absolute position within border zones (borders don't move)
     - Relative position within interior (scales with interior)
     - Right/bottom border positions anchor to the new right/bottom edges
     """
-    # Horizontal position
-    cx = src_left + layer_w / 2
+    # Horizontal position — use SOURCE layer width for center calc
+    cx = src_left + src_layer_w / 2
 
     if cx < ctx.bl:
-        # In left border — keep absolute position
         new_left = src_left
     elif cx > ctx.src_w - ctx.br:
-        # In right border — anchor to new right edge
         dist_from_right = ctx.src_w - src_left
         new_left = ctx.target_w - dist_from_right
     else:
-        # In interior — scale position relative to interior start
         rel_x = src_left - ctx.bl
         new_left = ctx.bl + int(rel_x * ctx.interior_scale_x)
 
-    # Vertical position
-    cy = src_top + layer_h / 2
+    # Vertical position — use SOURCE layer height for center calc
+    cy = src_top + src_layer_h / 2
 
     if cy < ctx.bt:
-        # In top border — keep absolute position
         new_top = src_top
     elif cy > ctx.src_h - ctx.bb:
-        # In bottom border — anchor to new bottom edge
         dist_from_bottom = ctx.src_h - src_top
         new_top = ctx.target_h - dist_from_bottom
     else:
-        # In interior — scale position relative to interior start
         rel_y = src_top - ctx.bt
         new_top = ctx.bt + int(rel_y * ctx.interior_scale_y)
 
     return new_left, new_top
+
+
+def _pil_nine_slice(image: Image.Image, ctx: _ScaleContext) -> Image.Image:
+    """Apply 9-slice scaling to a PIL image using the scale context borders.
+
+    Corners stay fixed, border strips scale in one axis, interior scales freely.
+    """
+    bt, bb, bl, br = ctx.bt, ctx.bb, ctx.bl, ctx.br
+    src_w, src_h = image.width, image.height
+    tgt_w, tgt_h = ctx.target_w, ctx.target_h
+
+    # Interior dimensions
+    src_iw = src_w - bl - br
+    src_ih = src_h - bt - bb
+    tgt_iw = tgt_w - bl - br
+    tgt_ih = tgt_h - bt - bb
+
+    if src_iw <= 0 or src_ih <= 0 or tgt_iw <= 0 or tgt_ih <= 0:
+        return _pil_resize(image, tgt_w, tgt_h)
+
+    # If any border is zero, skip cropping that edge
+    if bl == 0 and br == 0 and bt == 0 and bb == 0:
+        return _pil_resize(image, tgt_w, tgt_h)
+
+    # Crop 9 regions
+    corner_tl = image.crop((0, 0, bl, bt))
+    corner_tr = image.crop((src_w - br, 0, src_w, bt))
+    corner_bl = image.crop((0, src_h - bb, bl, src_h))
+    corner_br = image.crop((src_w - br, src_h - bb, src_w, src_h))
+
+    strip_top = image.crop((bl, 0, src_w - br, bt))
+    strip_bottom = image.crop((bl, src_h - bb, src_w - br, src_h))
+    strip_left = image.crop((0, bt, bl, src_h - bb))
+    strip_right = image.crop((src_w - br, bt, src_w, src_h - bb))
+
+    interior = image.crop((bl, bt, src_w - br, src_h - bb))
+
+    # Resize pieces
+    strip_top = _pil_resize(strip_top, tgt_iw, bt)
+    strip_bottom = _pil_resize(strip_bottom, tgt_iw, bb)
+    strip_left = _pil_resize(strip_left, bl, tgt_ih)
+    strip_right = _pil_resize(strip_right, br, tgt_ih)
+    interior = _pil_resize(interior, tgt_iw, tgt_ih)
+
+    # Assemble
+    canvas = Image.new(image.mode, (tgt_w, tgt_h))
+    canvas.paste(corner_tl, (0, 0))
+    canvas.paste(corner_tr, (tgt_w - br, 0))
+    canvas.paste(corner_bl, (0, tgt_h - bb))
+    canvas.paste(corner_br, (tgt_w - br, tgt_h - bb))
+    canvas.paste(strip_top, (bl, 0))
+    canvas.paste(strip_bottom, (bl, tgt_h - bb))
+    canvas.paste(strip_left, (0, bt))
+    canvas.paste(strip_right, (tgt_w - br, bt))
+    canvas.paste(interior, (bl, bt))
+
+    return canvas
+
+
+def _flatten_alpha(image: Image.Image) -> Image.Image:
+    """Keep RGBA as-is — PSD format supports per-layer alpha for transparency."""
+    return image
 
 
 def _pil_resize(image: Image.Image, width: int, height: int) -> Image.Image:
